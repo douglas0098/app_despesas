@@ -25,9 +25,24 @@ class _HomeScreenState extends State<HomeScreen> {
     _carregarSaldo();
   }
 
+  // Identifica a carga mais recente: se o usuário trocar de mês (ou voltar
+  // de outra tela) enquanto uma carga anterior ainda roda, o resultado
+  // antigo é descartado e não sobrescreve o saldo atual.
+  int _cargaAtual = 0;
+
   Future<void> _carregarSaldo() async {
-    final saldo = await DBHelper.instance.calcularSaldoDinamico(_mesReferencia);
-    setState(() => _saldo = saldo);
+    final minhaCarga = ++_cargaAtual;
+    try {
+      final saldo =
+          await DBHelper.instance.calcularSaldoDinamico(_mesReferencia);
+      if (!mounted || minhaCarga != _cargaAtual) return;
+      setState(() => _saldo = saldo);
+    } catch (e) {
+      if (!mounted || minhaCarga != _cargaAtual) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Não foi possível atualizar o saldo: $e')),
+      );
+    }
   }
 
   void _mudarMes(int delta) {

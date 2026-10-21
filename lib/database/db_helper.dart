@@ -301,6 +301,36 @@ class DBHelper {
     return result.first['total'] as int;
   }
 
+  /// Todos os lançamentos de um grupo (parcelas de uma compra, ou
+  /// ocorrências de uma recorrência), na ordem em que foram criados — ou
+  /// seja, parcela 1, 2, 3...
+  Future<List<Lancamento>> listarLancamentosDoGrupo(int grupoId) async {
+    final db = await database;
+    final maps = await db.query(
+      'lancamentos',
+      where: 'grupo_id = ?',
+      whereArgs: [grupoId],
+      orderBy: 'id ASC',
+    );
+    return maps.map((m) => Lancamento.fromMap(m)).toList();
+  }
+
+  /// Atualiza vários lançamentos de uma vez, numa única transação: ou
+  /// todos são salvos, ou nenhum.
+  Future<void> atualizarLancamentosEmLote(List<Lancamento> lista) async {
+    final db = await database;
+    final batch = db.batch();
+    for (final l in lista) {
+      batch.update(
+        'lancamentos',
+        l.toMap()..remove('id'),
+        where: 'id = ?',
+        whereArgs: [l.id],
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
   /// Próximo grupo_id disponível, usado para vincular parcelas/recorrências
   /// recém-criadas antes de terem um id de lançamento próprio.
   Future<int> proximoGrupoId() async {
@@ -328,14 +358,11 @@ class DBHelper {
   /// receita cadastrada naquele mês, cobrindo do dia dessa receita até o
   /// dia anterior à próxima. Cada despesa é descontada do painel cujo
   /// intervalo de dias contém o dia da sua data de pagamento.
+  ///
+  /// A regra em si fica em [montarSaldoDinamico] (sem acesso a banco), para
+  /// poder ser testada isoladamente.
   Future<SaldoDinamico> calcularSaldoDinamico(String mesReferencia) async {
     final lancamentos = await listarLancamentosDoMes(mesReferencia);
-
-    final receitas = lancamentos.where((l) => l.tipo == TipoLancamento.receita).toList();
-    final despesas = lancamentos.where((l) => l.tipo == TipoLancamento.despesa).toList();
-
-    final despesaTotal = despesas.fold(0.0, (s, l) => s + l.valor);
-    final receitaTotal = receitas.fold(0.0, (s, l) => s + l.valor);
 
     // Mapas de apoio para transformar cartao_id/boleto_id/categoria_id em
     // um nome de exibição, usados para agrupar as despesas por fonte
@@ -344,88 +371,123 @@ class DBHelper {
     final cartoes = await listarCartoes();
     final boletos = await listarBoletos(apenasAtivos: false);
     final categorias = await listarCategorias();
-    final cartoesPorId = {for (final c in cartoes) c.id: c.nome};
-    final boletosPorId = {for (final b in boletos) b.id: b.nome};
-    final categoriasPorId = {for (final c in categorias) c.id: c};
+    final cartoesPorId = <int?, String>{for (final c in cartoes) c.id: c.nome};
+    final boletosPorId = <int?, String>{for (final b in boletos) b.id: b.nome};
+    final categoriasPorId = <int?, Categoria>{for (final c in categorias) c.id: c};
 
-    if (receitas.isEmpty) {
-      return SaldoDinamico(
-        periodos: despesaTotal == 0
-            ? []
-            : [
-                PeriodoSaldo(
-                  titulo: 'Sem receita cadastrada neste mês',
-                  receita: 0,
-                  despesa: despesaTotal,
-                  despesasDetalhe: despesas,
-                ).comResumoFontes(cartoesPorId, boletosPorId, categoriasPorId)
-              ],
-        receitaTotal: 0,
-        despesaTotal: despesaTotal,
-      );
-    }
+    return montarSaldoDinamico(
+      lancamentos,
+      cartoesPorId: cartoesPorId,
+      boletosPorId: boletosPorId,
+      categoriasPorId: categoriasPorId,
+    );
+  }
+}
 
-    // Agrupa receitas por dia (duas receitas no mesmo dia viram um painel só).
-    final Map<int, double> receitaPorDia = {};
-    final Map<int, List<String>> descricoesPorDia = {};
-    for (final r in receitas) {
-      final dia = r.dataPagamento.day;
-      receitaPorDia[dia] = (receitaPorDia[dia] ?? 0) + r.valor;
-      descricoesPorDia.putIfAbsent(dia, () => []).add(r.descricao);
-    }
+/// Monta os painéis de saldo de um mês a partir dos lançamentos já
+/// filtrados para esse mês. Não acessa o banco.
+///
+/// Importante: as listas de despesas de cada painel são sempre listas
+/// modificáveis. Um painel de receita sem nenhuma despesa (caso da primeira
+/// receita cadastrada) não pode usar `const []`, pois ordenar uma lista
+/// const lança `UnsupportedError` e o saldo da tela inicial não atualizava.
+SaldoDinamico montarSaldoDinamico(
+  List<Lancamento> lancamentos, {
+  Map<int?, String> cartoesPorId = const {},
+  Map<int?, String> boletosPorId = const {},
+  Map<int?, Categoria> categoriasPorId = const {},
+}) {
+  final receitas =
+      lancamentos.where((l) => l.tipo == TipoLancamento.receita).toList();
+  final despesas =
+      lancamentos.where((l) => l.tipo == TipoLancamento.despesa).toList();
 
-    final dias = receitaPorDia.keys.toList()..sort();
+  final despesaTotal = despesas.fold(0.0, (s, l) => s + l.valor);
+  final receitaTotal = receitas.fold(0.0, (s, l) => s + l.valor);
 
-    // Constrói os intervalos [inicio, fim] de cada painel, com o último
-    // "dando a volta" no mês (cobre até o fim do mês e o começo, antes
-    // da primeira receita).
-    final periodos = <PeriodoSaldo>[];
-    for (var i = 0; i < dias.length; i++) {
-      final inicio = dias[i];
-      final fim = i + 1 < dias.length ? dias[i + 1] - 1 : dias[0] - 1;
-      periodos.add(PeriodoSaldo(
-        titulo: descricoesPorDia[inicio]!.toSet().join(' + '),
-        diaInicio: inicio,
-        diaFim: fim,
-        receita: receitaPorDia[inicio]!,
-        despesa: 0,
-      ));
-    }
+  int compararDescricao(Lancamento a, Lancamento b) =>
+      a.descricao.toLowerCase().compareTo(b.descricao.toLowerCase());
 
-    bool diaNoPeriodo(int dia, int inicio, int fim) {
-      if (fim >= inicio) {
-        return dia >= inicio && dia <= fim;
-      }
-      // período dá a volta no mês (ex: início dia 30, fim dia 14)
-      return dia >= inicio || dia <= fim;
-    }
-
-    for (final d in despesas) {
-      final diaPagamento = d.dataPagamento.day;
-      final indice = periodos.indexWhere(
-          (p) => diaNoPeriodo(diaPagamento, p.diaInicio!, p.diaFim!));
-      final alvo = indice == -1 ? periodos.length - 1 : indice;
-      periodos[alvo] = periodos[alvo].copyWith(
-        despesa: periodos[alvo].despesa + d.valor,
-        despesasDetalhe: [...periodos[alvo].despesasDetalhe, d],
-      );
-    }
-
-    for (final p in periodos) {
-      p.despesasDetalhe.sort(
-          (a, b) => a.descricao.toLowerCase().compareTo(b.descricao.toLowerCase()));
-    }
-
-    final periodosComResumo = periodos
-        .map((p) => p.comResumoFontes(cartoesPorId, boletosPorId, categoriasPorId))
-        .toList();
-
+  if (receitas.isEmpty) {
     return SaldoDinamico(
-      periodos: periodosComResumo,
-      receitaTotal: receitaTotal,
+      periodos: despesaTotal == 0
+          ? <PeriodoSaldo>[]
+          : [
+              PeriodoSaldo(
+                titulo: 'Sem receita cadastrada neste mês',
+                receita: 0,
+                despesa: despesaTotal,
+                despesasDetalhe: List<Lancamento>.of(despesas)
+                  ..sort(compararDescricao),
+              ).comResumoFontes(cartoesPorId, boletosPorId, categoriasPorId)
+            ],
+      receitaTotal: 0,
       despesaTotal: despesaTotal,
     );
   }
+
+  // Agrupa receitas por dia (duas receitas no mesmo dia viram um painel só).
+  final Map<int, double> receitaPorDia = {};
+  final Map<int, List<String>> descricoesPorDia = {};
+  for (final r in receitas) {
+    final dia = r.dataPagamento.day;
+    receitaPorDia[dia] = (receitaPorDia[dia] ?? 0) + r.valor;
+    descricoesPorDia.putIfAbsent(dia, () => []).add(r.descricao);
+  }
+
+  final dias = receitaPorDia.keys.toList()..sort();
+
+  // Intervalos [inicio, fim] de cada painel, com o último "dando a volta"
+  // no mês (cobre até o fim do mês e o começo, antes da primeira receita).
+  final inicios = <int>[];
+  final fins = <int>[];
+  for (var i = 0; i < dias.length; i++) {
+    inicios.add(dias[i]);
+    fins.add(i + 1 < dias.length ? dias[i + 1] - 1 : dias[0] - 1);
+  }
+
+  bool diaNoPeriodo(int dia, int inicio, int fim) {
+    if (fim >= inicio) {
+      return dia >= inicio && dia <= fim;
+    }
+    // período dá a volta no mês (ex: início dia 30, fim dia 14)
+    return dia >= inicio || dia <= fim;
+  }
+
+  // Uma lista própria e modificável de despesas para cada painel.
+  final despesasPorPainel =
+      List.generate(dias.length, (_) => <Lancamento>[]);
+  for (final d in despesas) {
+    final diaPagamento = d.dataPagamento.day;
+    var indice = -1;
+    for (var i = 0; i < dias.length; i++) {
+      if (diaNoPeriodo(diaPagamento, inicios[i], fins[i])) {
+        indice = i;
+        break;
+      }
+    }
+    final alvo = indice == -1 ? dias.length - 1 : indice;
+    despesasPorPainel[alvo].add(d);
+  }
+
+  final periodos = <PeriodoSaldo>[];
+  for (var i = 0; i < dias.length; i++) {
+    final detalhe = despesasPorPainel[i]..sort(compararDescricao);
+    periodos.add(PeriodoSaldo(
+      titulo: descricoesPorDia[dias[i]]!.toSet().join(' + '),
+      diaInicio: inicios[i],
+      diaFim: fins[i],
+      receita: receitaPorDia[dias[i]]!,
+      despesa: detalhe.fold(0.0, (s, l) => s + l.valor),
+      despesasDetalhe: detalhe,
+    ).comResumoFontes(cartoesPorId, boletosPorId, categoriasPorId));
+  }
+
+  return SaldoDinamico(
+    periodos: periodos,
+    receitaTotal: receitaTotal,
+    despesaTotal: despesaTotal,
+  );
 }
 
 class CompraCartao {
@@ -466,8 +528,8 @@ class PeriodoSaldo {
     required this.despesa,
     List<Lancamento>? despesasDetalhe,
     List<ResumoFonte>? resumoFontes,
-  })  : despesasDetalhe = despesasDetalhe ?? const [],
-        resumoFontes = resumoFontes ?? const [];
+  })  : despesasDetalhe = despesasDetalhe ?? <Lancamento>[],
+        resumoFontes = resumoFontes ?? <ResumoFonte>[];
 
   double get saldo => receita - despesa;
 
@@ -493,57 +555,81 @@ class PeriodoSaldo {
     );
   }
 
-  /// Nome de exibição da fonte de uma despesa: nome do cartão, nome do
-  /// boleto, ou o rótulo do tipo de categoria (despesas fixas e outras
-  /// despesas são somadas num único total cada).
-  static String _nomeFonte(
-    Lancamento l,
-    Map<int?, String> cartoesPorId,
-    Map<int?, String> boletosPorId,
-    Map<int?, Categoria> categoriasPorId,
-  ) {
-    if (l.cartaoId != null) {
-      return cartoesPorId[l.cartaoId] ?? 'Cartão';
-    }
-    if (l.boletoId != null) {
-      return boletosPorId[l.boletoId] ?? 'Boleto';
-    }
-    final categoria = categoriasPorId[l.categoriaId];
-    if (categoria != null) {
-      switch (categoria.tipo) {
-        case TipoCategoria.despesaFixa:
-          return 'Despesas fixas';
-        case TipoCategoria.outras:
-          return 'Outras despesas';
-        case TipoCategoria.receita:
-          return categoria.nome;
-      }
-    }
-    return 'Outros';
-  }
-
   /// Retorna uma cópia deste painel com [resumoFontes] calculado a partir
-  /// de [despesasDetalhe], somando os valores por fonte.
+  /// de [despesasDetalhe]. Regras do resumo:
+  ///  - Compra no cartão: uma linha por cartão, com o total do painel.
+  ///  - Despesa fixa (recorrente sem cartão, ou boleto/categoria fixa de
+  ///    cadastros antigos): uma linha por despesa, com o nome dela.
+  ///  - Qualquer outra despesa: somada numa única linha "Outros".
+  /// Ordem: cartões, depois fixas, "Outros" por último (valor decrescente
+  /// dentro de cada grupo). A soma das linhas é sempre igual à despesa do
+  /// painel.
   PeriodoSaldo comResumoFontes(
     Map<int?, String> cartoesPorId,
     Map<int?, String> boletosPorId,
     Map<int?, Categoria> categoriasPorId,
   ) {
-    final Map<String, double> totalPorFonte = {};
-    for (final l in despesasDetalhe) {
-      final nome = _nomeFonte(l, cartoesPorId, boletosPorId, categoriasPorId);
-      totalPorFonte[nome] = (totalPorFonte[nome] ?? 0) + l.valor;
+    const ordemCartao = 0;
+    const ordemFixa = 1;
+    const ordemOutros = 2;
+
+    final linhas = <String, _LinhaResumo>{};
+
+    void somar(String chave, int ordem, String nome, double valor) {
+      final linha =
+          linhas.putIfAbsent(chave, () => _LinhaResumo(ordem, nome));
+      linha.valor += valor;
     }
-    final resumo = totalPorFonte.entries
-        .map((e) => ResumoFonte(nome: e.key, valor: e.value))
-        .toList()
-      ..sort((a, b) => b.valor.compareTo(a.valor));
+
+    for (final l in despesasDetalhe) {
+      if (l.cartaoId != null) {
+        somar('cartao:${l.cartaoId}', ordemCartao,
+            cartoesPorId[l.cartaoId] ?? 'Cartão', l.valor);
+        continue;
+      }
+
+      final categoria = categoriasPorId[l.categoriaId];
+      final ehFixa = l.grupoId != null ||
+          l.boletoId != null ||
+          categoria?.tipo == TipoCategoria.despesaFixa;
+
+      if (ehFixa) {
+        final chave = l.grupoId != null
+            ? 'fixa:grupo:${l.grupoId}'
+            : 'fixa:desc:${l.descricao.toLowerCase()}';
+        somar(chave, ordemFixa, l.descricao, l.valor);
+      } else {
+        somar('outros', ordemOutros, 'Outros', l.valor);
+      }
+    }
+
+    final ordenadas = linhas.values.toList()
+      ..sort((a, b) {
+        final porOrdem = a.ordem.compareTo(b.ordem);
+        if (porOrdem != 0) return porOrdem;
+        final porValor = b.valor.compareTo(a.valor);
+        if (porValor != 0) return porValor;
+        return a.nome.toLowerCase().compareTo(b.nome.toLowerCase());
+      });
+
+    final resumo = ordenadas
+        .map((e) => ResumoFonte(nome: e.nome, valor: e.valor))
+        .toList();
     return copyWith(resumoFontes: resumo);
   }
 }
 
-/// Total de despesas de um painel de saldo agrupado por fonte: nome de um
-/// cartão, de um boleto, ou "Despesas fixas" / "Outras despesas".
+/// Acumulador interno usado para montar o resumo de um painel.
+class _LinhaResumo {
+  final int ordem;
+  final String nome;
+  double valor = 0;
+
+  _LinhaResumo(this.ordem, this.nome);
+}
+
+/// Uma linha do resumo de um painel de saldo: o nome de um cartão, de uma
+/// despesa fixa, ou "Outros", com o total a pagar naquela receita.
 class ResumoFonte {
   final String nome;
   final double valor;

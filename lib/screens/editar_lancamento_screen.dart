@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import '../database/db_helper.dart';
 import '../models/lancamento.dart';
-import '../utils/date_utils.dart';
+import '../utils/parcelas_utils.dart';
 
 class EditarLancamentoScreen extends StatefulWidget {
   final Lancamento lancamento;
@@ -18,15 +18,60 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
   late final TextEditingController _diaPagamentoCtrl;
   late DateTime _data;
 
+  /// Parcelas da mesma compra (só quando este lançamento é uma parcela).
+  /// Enquanto é nulo, o grupo ainda está sendo carregado.
+  List<Lancamento>? _parcelas;
+  double _totalOriginal = 0;
+
+  bool get _ehParcela =>
+      widget.lancamento.grupoId != null && widget.lancamento.parcelaInfo != null;
+
   @override
   void initState() {
     super.initState();
     _descricaoCtrl = TextEditingController(text: widget.lancamento.descricao);
-    _valorCtrl = TextEditingController(
-        text: widget.lancamento.valor.toStringAsFixed(2).replaceAll('.', ','));
+    _valorCtrl = TextEditingController(text: _fmt(widget.lancamento.valor));
     _diaPagamentoCtrl =
         TextEditingController(text: widget.lancamento.dataPagamento.day.toString());
     _data = widget.lancamento.data;
+    if (_ehParcela) _carregarParcelas();
+  }
+
+  @override
+  void dispose() {
+    _descricaoCtrl.dispose();
+    _valorCtrl.dispose();
+    _diaPagamentoCtrl.dispose();
+    super.dispose();
+  }
+
+  String _fmt(double v) => v.toStringAsFixed(2).replaceAll('.', ',');
+
+  double? _parseValor(String texto) =>
+      double.tryParse(texto.replaceAll('.', '').replaceAll(',', '.'));
+
+  /// Carrega todas as parcelas da compra: o campo de valor passa a mostrar
+  /// o valor TOTAL da compra, e a edição vale para todas elas.
+  Future<void> _carregarParcelas() async {
+    List<Lancamento> parcelas;
+    try {
+      parcelas = await DBHelper.instance
+          .listarLancamentosDoGrupo(widget.lancamento.grupoId!);
+    } catch (_) {
+      parcelas = [];
+    }
+    if (parcelas.isEmpty) parcelas = [widget.lancamento];
+    if (!mounted) return;
+
+    final total = parcelas.fold(0.0, (s, p) => s + p.valor);
+    setState(() {
+      _parcelas = parcelas;
+      _totalOriginal = double.parse(total.toStringAsFixed(2));
+      _valorCtrl.text = _fmt(_totalOriginal);
+      // O campo de data de uma compra parcelada é a data da COMPRA (a da
+      // primeira parcela), e não a data da parcela que foi aberta.
+      _data = parcelas.first.data;
+    });
   }
 
   Future<void> _selecionarData() async {
@@ -39,26 +84,91 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
     if (novaData != null) setState(() => _data = novaData);
   }
 
+  bool _mesmoDia(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
   Future<void> _salvar() async {
     if (!_formKey.currentState!.validate()) return;
 
-    final valor =
-        double.parse(_valorCtrl.text.replaceAll('.', '').replaceAll(',', '.'));
-    final diaPagamento =
-        int.tryParse(_diaPagamentoCtrl.text) ?? widget.lancamento.dataPagamento.day;
+    final l = widget.lancamento;
+    final descricao = _descricaoCtrl.text.trim();
+    final valor = _parseValor(_valorCtrl.text)!;
+    final diaPagamento = int.tryParse(_diaPagamentoCtrl.text) ?? l.dataPagamento.day;
 
-    final atualizado = widget.lancamento.copyWith(
-      descricao: _descricaoCtrl.text.trim(),
-      valor: valor,
-      data: _data,
-      dataPagamento: widget.lancamento.tipo == TipoLancamento.receita
+    if (_ehParcela && _parcelas != null) {
+      await _salvarCompraParcelada(descricao, valor, diaPagamento);
+    } else {
+      // Data de pagamento deste lançamento. O mês de pagamento acompanha o
+      // deslocamento da data da compra, mas NÃO é recalculado a partir do
+      // mês da compra (isso fazia compras no cartão sumirem do mês em que
+      // são pagas).
+      final dataPagamento = l.tipo == TipoLancamento.receita
           ? _data
-          : DateTime(_data.year, _data.month,
-              clampDiaNoMes(_data.year, _data.month, diaPagamento)),
-    );
+          : pagamentoAposMudarData(
+              dataAnterior: l.data,
+              dataNova: _data,
+              pagamentoAnterior: l.dataPagamento,
+              dia: diaPagamento,
+            );
 
-    await DBHelper.instance.atualizarLancamento(atualizado);
+      final atualizado = l.copyWith(
+        descricao: descricao,
+        valor: valor,
+        data: _data,
+        dataPagamento: dataPagamento,
+      );
+      await DBHelper.instance.atualizarLancamento(atualizado);
+    }
+
     if (mounted) Navigator.pop(context, true);
+  }
+
+  /// Salva a edição de uma compra parcelada, aplicando a TODAS as parcelas:
+  ///  - nova data da compra: as parcelas passam a cair nos meses seguintes à
+  ///    nova data (e os vencimentos acompanham o mesmo deslocamento);
+  ///  - novo valor total: redividido entre as parcelas;
+  ///  - novo dia de pagamento e nova descrição.
+  /// Só o que o usuário realmente mudou é propagado.
+  Future<void> _salvarCompraParcelada(
+      String descricao, double valor, int diaPagamento) async {
+    final l = widget.lancamento;
+    var lista = List<Lancamento>.of(_parcelas!);
+
+    // A "data da compra" é a data da primeira parcela.
+    final dataCompraAtual = lista.first.data;
+    if (!_mesmoDia(_data, dataCompraAtual)) {
+      // Se a compra foi no cartão, o deslocamento considera o fechamento da
+      // fatura (comprar depois do fechamento joga para a fatura seguinte).
+      int? diaFechamento;
+      int? diaVencimento;
+      if (l.cartaoId != null) {
+        final cartoes = await DBHelper.instance.listarCartoes();
+        final indice = cartoes.indexWhere((c) => c.id == l.cartaoId);
+        if (indice != -1) {
+          diaFechamento = cartoes[indice].diaFechamento;
+          diaVencimento = cartoes[indice].diaVencimento;
+        }
+      }
+      final deslocamento = deslocamentoDePagamento(
+        dataAnterior: dataCompraAtual,
+        dataNova: _data,
+        diaFechamento: diaFechamento,
+        diaVencimento: diaVencimento,
+      );
+      lista = mudarDataDaCompraParcelada(lista, _data, deslocamento);
+    }
+
+    final descricaoMudou = descricao != l.descricao;
+    final totalMudou = (valor - _totalOriginal).abs() > 0.004;
+    final diaMudou = diaPagamento != l.dataPagamento.day;
+
+    final resultado = aplicarEdicaoNasParcelas(
+      lista,
+      novaDescricao: descricaoMudou ? descricao : null,
+      novoValorTotal: totalMudou ? valor : null,
+      novoDiaPagamento: diaMudou ? diaPagamento : null,
+    );
+    await DBHelper.instance.atualizarLancamentosEmLote(resultado);
   }
 
   Future<void> _excluir() async {
@@ -124,9 +234,26 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
     }
   }
 
+  /// Texto de apoio do campo de valor de uma compra parcelada, mostrando
+  /// como o total digitado ficará dividido.
+  String _resumoDivisao() {
+    final n = _parcelas?.length ?? 1;
+    final total = _parseValor(_valorCtrl.text);
+    if (total == null || n < 2) return '';
+    final valores = dividirEmParcelas(total, n);
+    if (valores.first == valores.last) {
+      return '$n parcelas de R\$ ${_fmt(valores.first)}';
+    }
+    return '${n - 1} parcelas de R\$ ${_fmt(valores.first)} '
+        'e a última de R\$ ${_fmt(valores.last)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final l = widget.lancamento;
+    final carregandoParcelas = _ehParcela && _parcelas == null;
+    final nParcelas = _parcelas?.length ?? 1;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Editar lançamento'),
@@ -146,7 +273,19 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
               if (l.parcelaInfo != null)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 12),
-                  child: Chip(label: Text('Parcela ${l.parcelaInfo}')),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Chip(label: Text('Parcela ${l.parcelaInfo}')),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Descrição, data da compra, valor total e dia de '
+                        'pagamento valem para todas as parcelas.',
+                        style: TextStyle(
+                            fontSize: 12, color: Colors.grey.shade700),
+                      ),
+                    ],
+                  ),
                 ),
               TextFormField(
                 controller: _descricaoCtrl,
@@ -157,21 +296,30 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
               const SizedBox(height: 12),
               TextFormField(
                 controller: _valorCtrl,
-                decoration: const InputDecoration(labelText: 'Valor (R\$)'),
+                decoration: InputDecoration(
+                  labelText:
+                      _ehParcela ? 'Valor total da compra (R\$)' : 'Valor (R\$)',
+                  helperText:
+                      _ehParcela && nParcelas > 1 ? _resumoDivisao() : null,
+                ),
                 keyboardType:
                     const TextInputType.numberWithOptions(decimal: true),
                 validator: (v) {
                   if (v == null || v.trim().isEmpty) return 'Informe um valor';
-                  final normalizado = v.replaceAll('.', '').replaceAll(',', '.');
-                  if (double.tryParse(normalizado) == null) return 'Valor inválido';
+                  if (_parseValor(v) == null) return 'Valor inválido';
                   return null;
                 },
+                onChanged: (_) => setState(() {}),
               ),
               const SizedBox(height: 12),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: Text(
-                    'Data: ${_data.day.toString().padLeft(2, '0')}/${_data.month.toString().padLeft(2, '0')}/${_data.year}'),
+                    '${_ehParcela ? 'Data da compra' : 'Data'}: ${_data.day.toString().padLeft(2, '0')}/${_data.month.toString().padLeft(2, '0')}/${_data.year}'),
+                subtitle: _ehParcela
+                    ? const Text(
+                        'Muda a data e os vencimentos de todas as parcelas')
+                    : null,
                 trailing: const Icon(Icons.calendar_today),
                 onTap: _selecionarData,
               ),
@@ -179,9 +327,11 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _diaPagamentoCtrl,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: 'Dia de pagamento',
-                    helperText: 'Dia usado no cálculo do saldo por receita',
+                    helperText: _ehParcela
+                        ? 'Muda o dia em todas as parcelas, mantendo o mês de cada uma'
+                        : 'Dia usado no cálculo do saldo por receita',
                   ),
                   keyboardType: TextInputType.number,
                   validator: (v) {
@@ -195,10 +345,12 @@ class _EditarLancamentoScreenState extends State<EditarLancamentoScreen> {
               ],
               const SizedBox(height: 24),
               ElevatedButton(
-                onPressed: _salvar,
-                child: const Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Text('Salvar alterações'),
+                onPressed: carregandoParcelas ? null : _salvar,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(carregandoParcelas
+                      ? 'Carregando parcelas...'
+                      : 'Salvar alterações'),
                 ),
               ),
               if (l.grupoId != null) ...[
