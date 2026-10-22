@@ -156,3 +156,63 @@ DateTime dataDePagamentoDaDespesa({
   }
   return diaManual == null ? base : comDiaDePagamento(base, diaManual);
 }
+
+/// Data de pagamento de uma despesa avulsa ou de uma parcela, na data de
+/// compra [dataBase]:
+///  - Compra no cartão ([diaFechamento] e [diaVencimento] informados): o MÊS
+///    é sempre o do vencimento da fatura (respeitando o fechamento). Se o
+///    usuário informou [diaOverride], só o DIA muda: a compra continua na
+///    fatura do cartão, mas o pagamento é antecipado (ou adiado) para esse
+///    dia dentro do mês da fatura.
+///  - Sem cartão: usa [diaOverride] no mês da própria data, ou a própria data.
+DateTime calcularDataPagamento(
+  DateTime dataBase, {
+  int? diaOverride,
+  int? diaFechamento,
+  int? diaVencimento,
+}) {
+  if (diaFechamento != null && diaVencimento != null) {
+    final vencimento =
+        calcularVencimentoFatura(dataBase, diaFechamento, diaVencimento);
+    if (diaOverride == null) return vencimento;
+    return DateTime(
+      vencimento.year,
+      vencimento.month,
+      clampDiaNoMes(vencimento.year, vencimento.month, diaOverride),
+    );
+  }
+  if (diaOverride != null) {
+    return DateTime(dataBase.year, dataBase.month,
+        clampDiaNoMes(dataBase.year, dataBase.month, diaOverride));
+  }
+  return dataBase;
+}
+
+/// Data de pagamento de uma despesa na hora de lançar.
+///
+/// Compra no cartão ([diaFechamento] e [diaVencimento] informados): o mês é
+/// sempre o da fatura em que a compra cai (compra depois do fechamento vai
+/// para a fatura seguinte). Se há [diaPagamentoManual], ele só troca o dia
+/// dentro desse mesmo mês, funcionando como adiantamento da fatura. Assim
+/// uma compra de julho paga "dia 10" num cartão que vence dia 15 continua
+/// caindo na fatura de agosto, e não em julho.
+///
+/// Sem cartão: o dia manual vale no mês da própria despesa; sem dia manual,
+/// a data é a da própria despesa.
+DateTime calcularDataPagamentoDespesa({
+  required DateTime dataCompra,
+  int? diaPagamentoManual,
+  int? diaFechamento,
+  int? diaVencimento,
+}) {
+  if (diaFechamento != null && diaVencimento != null) {
+    final vencimento =
+        calcularVencimentoFatura(dataCompra, diaFechamento, diaVencimento);
+    if (diaPagamentoManual == null) return vencimento;
+    return comDiaDePagamento(vencimento, diaPagamentoManual);
+  }
+  if (diaPagamentoManual != null) {
+    return comDiaDePagamento(dataCompra, diaPagamentoManual);
+  }
+  return dataCompra;
+}

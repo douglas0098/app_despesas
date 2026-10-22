@@ -54,40 +54,19 @@ class _NovoLancamentoScreenState extends State<NovoLancamentoScreen> {
     return double.parse(texto.replaceAll('.', '').replaceAll(',', '.'));
   }
 
-  /// Calcula a data de pagamento de uma despesa (ou de uma parcela):
-  ///  - compra no cartão: o mês é o do vencimento da fatura (respeitando o
-  ///    fechamento). Se o usuário informou um dia de pagamento, só o DIA
-  ///    muda, dentro do mês da fatura — ou seja, pagar antes do vencimento é
-  ///    um adiantamento da fatura, e não uma compra do mês em que foi feita;
-  ///  - sem cartão: a própria data da despesa, com o dia de pagamento manual
-  ///    se informado.
+  /// Calcula a data de pagamento de uma despesa (avulsa ou uma parcela):
+  ///  - compra no cartão: o MÊS vem sempre da fatura do cartão (fechamento e
+  ///    vencimento). Se o usuário informou um dia de pagamento manual, ele só
+  ///    troca o DIA dentro desse mesmo mês (adiantamento da fatura);
+  ///  - sem cartão: dia manual no mês da própria despesa, ou a própria data.
   DateTime _calcularDataPagamentoDespesa(DateTime dataBase) {
     final cartao = _ehCompraNoCartao ? _cartaoSelecionado : null;
-    return dataDePagamentoDaDespesa(
+    return calcularDataPagamentoDespesa(
       dataCompra: dataBase,
+      diaPagamentoManual: int.tryParse(_diaPagamentoCtrl.text),
       diaFechamento: cartao?.diaFechamento,
       diaVencimento: cartao?.diaVencimento,
-      diaManual: int.tryParse(_diaPagamentoCtrl.text),
     );
-  }
-
-  String _fmtData(DateTime d) =>
-      '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
-
-  /// Texto de apoio do campo "Dia de pagamento" numa compra no cartão,
-  /// mostrando quando a (primeira) parcela será paga.
-  String _textoPagamentoCartao() {
-    final cartao = _cartaoSelecionado;
-    if (cartao == null) return 'Selecione o cartão para ver quando será paga';
-    final vencimento = calcularVencimentoFatura(
-        _data, cartao.diaFechamento, cartao.diaVencimento);
-    final pagamento = _calcularDataPagamentoDespesa(_data);
-    if (int.tryParse(_diaPagamentoCtrl.text) == null) {
-      return 'Em branco: paga no vencimento da fatura, ${_fmtData(vencimento)}';
-    }
-    final adiantada = pagamento.isBefore(vencimento);
-    return 'Paga em ${_fmtData(pagamento)}'
-        '${adiantada ? ' (adiantamento da fatura que vence em ${_fmtData(vencimento)})' : ''}';
   }
 
   Future<void> _salvar() async {
@@ -305,11 +284,10 @@ class _NovoLancamentoScreenState extends State<NovoLancamentoScreen> {
                   decoration: InputDecoration(
                     labelText: 'Dia de pagamento (opcional)',
                     helperText: _ehCompraNoCartao
-                        ? _textoPagamentoCartao()
+                        ? 'Deixe em branco para usar o vencimento automático do cartão'
                         : 'Em qual dia essa despesa deve ser descontada',
                   ),
                   keyboardType: TextInputType.number,
-                  onChanged: (_) => setState(() {}),
                   validator: (v) {
                     if (v == null || v.trim().isEmpty) return null;
                     final dia = int.tryParse(v);
